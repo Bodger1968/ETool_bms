@@ -1,0 +1,2 @@
+add_executable(socketcan_example can_example.cpp)
+target_link_libraries(socketcan_example PRIVATE socketcan)
