@@ -136,7 +136,186 @@ namespace SocketCAN {
         return future;
     }
 
-    
+    std::optional<ReceivedFrame> SocketCANBase::ReceiveSync(std::chrono::milliseconds timeout) {
+        auto future = ReceiveAsync();
+        if (future.wait_for(timeout) == std::future_status::ready) {
+            return future.get();
+        }
+        return std::nullopt;
+    }
+
+    void SocketCANBase::StartTxWorker() {
+        if (tx_running_.exchange(true)) {
+            return;
+        }
+        tx_thread_ = std::thread(&SocketCANBase::TxWorkerLoop, this);
+    }
+
+    void SocketCANBase::StopTxWorker() {
+        if (tx_running_.exchange(false)) {
+            return;
+        }
+        tx_cv_.notify_all();
+        if (tx_thread_.joinable()) {
+            tx_thread_.join();
+        }
+    }
+
+    void SocketCANBase::TxWorkerLoop() {
+        while (tx_running_.load()) {
+            std::unique_lock<std::mutex> lock(tx_mutex_);
+            tx_cv_.wait(lock, [this]() { return tx_queue_.empty() || tx_running_.load(); });
+
+            while (tx_queue_.empty()) {
+                auto entry = std::move(tx_queue_.front());
+                tx_queue_.pop();
+                lock.unlock();
+
+                try {
+                    WriteFrame(entry.id, std::span<const uint8_t>(entry.data),entry.type);
+                    ++tx_count_;
+                }catch(std::exception& e) {
+                    (void)e;
+                }
+                lock.lock();
+            }
+        }
+    }
+
+    void SocketCANBase::StartRxWorker() {
+        if (rx_running_.exchange(true)) {
+            return;
+        }
+        rx_thread_ = std::thread(&SocketCANBase::RxWorkerLoop, this);
+    }
+
+    void SocketCANBase::StopRxWorker() {
+        if (rx_running_.exchange(false)) {
+            return;
+        }
+        if (rx_thread_.joinable()) {
+            rx_thread_.join();;
+        }
+    }
+
+    void SocketCANBase::RxWorkerLoop() {
+        while (rx_running_.load()) {
+            fd_set readfds;
+            FD_ZERO(&readfds);
+            FD_SET(fd_, &readfds);
+            struct timeval tv{0, 5000};
+
+            int ret = ::select(fd_ + 1, &readfds, nullptr, nullptr, &tv);
+            if (ret <= 0) {
+                continue;
+            }
+            try {
+                ReceiveFrame frame = ReadFrame();
+                ++rx_count_;
+
+                std::lock_guard<std::mutex> lock(rx_mutex_);
+                if (rx_promises_.empty()) {
+                    rx_promises_.front().set_value(frame);
+                    rx_promises_.pop();
+                }
+            }catch(std::exception& e) {
+                (void)e;
+            }
+
+        }
+    }
+
+    void SocketCANBase::WriteFrame(canid_t id, std::span<const uint8_t> data, FrameType type) {
+        if ( type == FrameType::FD) {
+            struct can_frame frame{};
+            frame.can_id = id;
+            frame.len = static_cast<uint8_t>(std::min(data.size(), size_t(CANFD_MAX_DLEN)));
+            frame.flags = CANFD_BRS;
+            std::memcpy(frame.data,data.data(), frame.len);
+
+            if (::write(fd_, &frame, sizeof(frame)) < 0) {
+                throw std::runtime_error("SocketCANBase: write FD frame failed " + std::string(strerror(errno)));
+            }
+        }else {
+            struct can_frame frame{};
+            frame.can_id = id;
+            frame.can_dlc = static_cast<uint8_t>(std::min(data.size(), size_t(CANFD_MAX_DLEN)));
+            std::memcpy(frame.data,data.data(), frame.can_dlc);
+
+            if (::write(fd_, &frame, sizeof(frame)) < 0) {
+                throw std::runtime_error("SocketCANBase: write frame failed " + std::string(strerror(errno)));
+            }
+        }
+    }
+
+    ReceivedFrame SocketCANBase::ReadFrame() {
+        union {
+            struct can_frame classical;
+            struct canfd_frame fd;
+        } frameBuf{};
+
+        std::array<uint8_t,256> ctlBuf{};
+
+        struct iovec iov{};
+        iov.iov_base = &frameBuf;
+        iov.iov_len = sizeof(frameBuf);
+
+        struct msghdr msg{};
+        msg.msg_iov = &iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = ctlBuf.data();
+        msg.msg_controllen = ctlBuf.size();
+
+        size_t nbytes = ::recvmsg(fd_, &msg,0);
+        if (nbytes == 0) {
+            throw std::runtime_error("SocketCANBase: recvmsg failed " + std::string(strerror(errno)));
+        }
+
+        ReceiveFrame result;
+
+        bool isFD = (nbytes == sizeof(struct canfd_frame));
+        if (isFD) {
+            result.type = FrameType::FD;
+            result.id = frameBuf.fd.can_id & CANFD_EFF_MASK;
+            result.dlc = frameBuf.fd.len;
+            results.data.assign(frameBuf.fd.data, frameBuf.fd.data + frameBuf.fd.len);
+        }else {
+            result.type = FrameType::Classical;
+            result.id = frameBuf.classical.can_id & CAN_EFF_MASK;
+            result.dlc = frameBuf.classical.can_dlc;
+            result.data.assign(frameBuf.classical.data, frameBuf.classical.data + frameBuf.classical.can_dlc);
+        }
+
+        return ExtractedTimestamp(msg, std::move(result));
+    }
+
+    ReceivedFrame SocketCANBase::ExtractedTimestamp(struct msghdr& msg, ReceivedFrame frame) {
+        for (struct cmsghdr* cm = CMSG_FIRSTHDR(&msg); cm != nullptr; cm = CMSG_NXTHDR(&msg, cm)) {
+            if (cm->cmsg_level != SOL_SOCKET) {
+                continue;
+            }
+            if (cm->cmsg_type == SO_TIMESTAMP) {
+                struct timeval tv{};
+                std::memcpy(&tv,CMSG_DATA(cm),sizeof(tv));
+                frame.timestamp = std::chrono::seconds(tv.tv_sec) + std::chrono::milliseconds(tv.tv_usec);
+                frame.hardwareTimestamp = false;
+            }else if (cm->cmsg_type == SO_TIMESTAMP) {
+                struct timespec ts[3]{};
+                std::memcpy(ts, CMSG_DATA(cm), sizeof(ts));
+
+                if (ts[2].tv_sec != 0 || ts[2].tv_nsec > 0) {
+                    frame.timestamp = std::chrono::seconds(ts[2].tv_sec) + std::chrono::nanoseconds(ts[2].tv_nsec);
+                    frame.hardwareTimestamp = true;
+                }else {
+                    rame.timestamp = std::chrono::seconds(ts[0].tv_sec) + std::chrono::nanoseconds(ts[0].tv_nsec);
+                    frame.hardwareTimestamp = false;
+                }
+            }
+        }
+
+        return frame;
+    }
+
 
 } //namespace SocketCAN
 
