@@ -130,7 +130,7 @@ namespace SocketCAN {
 
         void ApplyTimeStampOptions();
         void ApplyFilters();
-        ReceivedFrame ExtractTimestamp(struct mshdr& msg, ReceivedFrame& frame);
+        ReceivedFrame ExtractTimestamp(struct mshdr& msg, ReceivedFrame  frame);
         int fd_{-1};
         BaseConfig cfg_;
 

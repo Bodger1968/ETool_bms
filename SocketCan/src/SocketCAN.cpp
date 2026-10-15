@@ -289,7 +289,7 @@ namespace SocketCAN {
         return ExtractedTimestamp(msg, std::move(result));
     }
 
-    ReceivedFrame SocketCANBase::ExtractedTimestamp(struct msghdr& msg, ReceivedFrame frame) {
+    ReceivedFrame SocketCANBase::ExtractTimestamp(struct mshdr& msg, ReceivedFrame  frame) {
         for (struct cmsghdr* cm = CMSG_FIRSTHDR(&msg); cm != nullptr; cm = CMSG_NXTHDR(&msg, cm)) {
             if (cm->cmsg_level != SOL_SOCKET) {
                 continue;
