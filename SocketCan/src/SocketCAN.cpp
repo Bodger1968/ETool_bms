@@ -45,7 +45,7 @@ namespace SocketCAN {
 
     void SocketCANBase::Close() {
         if (fd_ >=0) {
-            ::Close(fd_);
+            ::close(fd_);
             fd_ = -1;
         }
 
@@ -75,8 +75,8 @@ namespace SocketCAN {
 
         for (const auto& f : cfg_.filters) {
             struct can_filter cf{};
-            cf.can_id = f.id | (f.invertWatch ? CAN_INV_FILTER : 0);
-            cf.can_mask = f.mask | (f.invertWatch ? CAN_INV_FILTER : 0);
+            cf.can_id = f.id | (f.invertMatch ? CAN_INV_FILTER : 0);
+            cf.can_mask = f.mask | (f.invertMatch ? CAN_INV_FILTER : 0);
             raw.push_back(cf);
         }
 
@@ -210,7 +210,7 @@ namespace SocketCAN {
                 continue;
             }
             try {
-                ReceiveFrame frame = ReadFrame();
+                ReceivedFrame frame = ReadFrame();
                 ++rx_count_;
 
                 std::lock_guard<std::mutex> lock(rx_mutex_);
@@ -227,7 +227,7 @@ namespace SocketCAN {
 
     void SocketCANBase::WriteFrame(canid_t id, std::span<const uint8_t> data, FrameType type) {
         if ( type == FrameType::FD) {
-            struct can_frame frame{};
+            struct canfd_frame frame{};
             frame.can_id = id;
             frame.len = static_cast<uint8_t>(std::min(data.size(), size_t(CANFD_MAX_DLEN)));
             frame.flags = CANFD_BRS;
@@ -271,14 +271,14 @@ namespace SocketCAN {
             throw std::runtime_error("SocketCANBase: recvmsg failed " + std::string(strerror(errno)));
         }
 
-        ReceiveFrame result;
+        ReceivedFrame result;
 
         bool isFD = (nbytes == sizeof(struct canfd_frame));
         if (isFD) {
             result.type = FrameType::FD;
-            result.id = frameBuf.fd.can_id & CANFD_EFF_MASK;
+            result.id = frameBuf.fd.can_id & CAN_EFF_MASK;
             result.dlc = frameBuf.fd.len;
-            results.data.assign(frameBuf.fd.data, frameBuf.fd.data + frameBuf.fd.len);
+            result.data.assign(frameBuf.fd.data, frameBuf.fd.data + frameBuf.fd.len);
         }else {
             result.type = FrameType::Classical;
             result.id = frameBuf.classical.can_id & CAN_EFF_MASK;
@@ -286,10 +286,10 @@ namespace SocketCAN {
             result.data.assign(frameBuf.classical.data, frameBuf.classical.data + frameBuf.classical.can_dlc);
         }
 
-        return ExtractedTimestamp(msg, std::move(result));
+        return ExtractTimestamp(msg, std::move(result));
     }
 
-    ReceivedFrame SocketCANBase::ExtractTimestamp(struct mshdr& msg, ReceivedFrame  frame) {
+    ReceivedFrame SocketCANBase::ExtractTimestamp(struct msghdr& msg, ReceivedFrame  frame) {
         for (struct cmsghdr* cm = CMSG_FIRSTHDR(&msg); cm != nullptr; cm = CMSG_NXTHDR(&msg, cm)) {
             if (cm->cmsg_level != SOL_SOCKET) {
                 continue;
@@ -307,7 +307,7 @@ namespace SocketCAN {
                     frame.timestamp = std::chrono::seconds(ts[2].tv_sec) + std::chrono::nanoseconds(ts[2].tv_nsec);
                     frame.hardwareTimestamp = true;
                 }else {
-                    rame.timestamp = std::chrono::seconds(ts[0].tv_sec) + std::chrono::nanoseconds(ts[0].tv_nsec);
+                    frame.timestamp = std::chrono::seconds(ts[0].tv_sec) + std::chrono::nanoseconds(ts[0].tv_nsec);
                     frame.hardwareTimestamp = false;
                 }
             }

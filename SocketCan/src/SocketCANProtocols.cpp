@@ -150,7 +150,151 @@ namespace SocketCAN {
     void SocketCANIsoTp::ApplySocketOptions() {
         struct can_isotp_options opts{};
 
+        if (config_.extended_addressing) {
+            opts.flags    |= CAN_ISOTP_EXTEND_ADDR;
+            opts.ext_address = config_.tx_ext_address;
+            opts.rx_ext_address = config_.rx_ext_address;
+        }
+
+        if (config_.tx_padding) {
+            opts.flags       |= CAN_ISOTP_TX_PADDING;
+            opts.txpad_content = static_cast<uint8_t>( config_.tx_padding);
+        }
+
+        if (config_.wait_tx_done) {
+            opts.flags       |= CAN_ISOTP_WAIT_TX_DONE;
+        }
+
+        if (setsockopt(fd_, SOL_CAN_ISOTP, CAN_ISOTP_OPTS, &opts, sizeof(opts)) < 0) {
+            throw std::runtime_error("SocketCAN ISOTP: CAN_ISOTP_OPTS failed: " + std::string(strerror(errno)));
+        }
+
+        if (config_.rx_block_size || config_.st_min_ns) {
+            struct can_isotp_fc_options fc{};
+            fc.bs    = static_cast<uint8_t>( config_.rx_block_size);
+            fc.stmin = 0; // kernel handles stmin from stMinNs
+            fc.wftmax = 0;
+            if (setsockopt(fd_, SOL_CAN_ISOTP, CAN_ISOTP_RECV_FC, &fc, sizeof(fc)) < 0) {
+                throw std::runtime_error("SocketCAN ISOTP: CAN_ISOTP_RECV_FC failed: " + std::string(strerror(errno)));
+            }
+        }
+    }
+
+    void SocketCANIsoTp::SendPayload(std::span<const uint8_t> payload) {
+        if (::write( fd_, payload.data(), payload.size()) < 0) {
+            throw std::runtime_error("SocketCAN ISOTP: write failed: " + std::string(strerror(errno)));
+        }
+    }
+
+    std::future<std::vector<uint8_t> > SocketCANIsoTp::ReceivePayloadAsync() {
+        return std::async(std::launch::async, [this]() -> std::vector<uint8_t> {
+            std::vector<uint8_t> buf(4096);
+            ssize_t n = ::read(fd_, buf.data(), buf.size());
+            if (n < 0) {
+                throw std::runtime_error("SocketCAN ISOTP: read failed: " + std::string(strerror(errno)));
+            }
+            buf.resize(static_cast<size_t>(n));
+        return buf;
+        });
+    }
+    std::optional<std::vector<uint8_t>> SocketCANIsoTp::ReceivePayloadSync(std::chrono::milliseconds timeout)
+    {
+        // Use select() directly rather than going through the promise queue,
+        // which can accumulate stale unfulfilled promises and miss frames.
+        fd_set readfds;
+        FD_ZERO(&readfds);
+        FD_SET( fd_, &readfds);
+
+        struct timeval tv{};
+        tv.tv_sec  = timeout.count() / 1000;
+        tv.tv_usec = (timeout.count() % 1000) * 1000;
+
+        int ret = ::select(fd_ + 1, &readfds, nullptr, nullptr, &tv);
+        if (ret <= 0)
+            return std::nullopt; // timeout or error
+
+        std::vector<uint8_t> buf(4096);
+        ssize_t n = ::read( fd_, buf.data(), buf.size());
+        if (n <= 0)
+            return std::nullopt;
+
+        buf.resize(static_cast<size_t>(n));
+        return buf;
+    }
+
+    // J1939
+
+    SocketCANJ1939::SocketCANJ1939(const J1939Config &cfg) : SocketCANBase(cfg), config_(cfg) {
 
     }
 
+    int SocketCANJ1939::CreateSocket(){
+        return ::socket(PF_CAN, SOCK_DGRAM, CAN_J1939);
+    }
+
+    void SocketCANJ1939::BindSocket() {
+        struct ifreq ifr{};
+        std::strncpy(ifr.ifr_name, config_.interface.c_str(), IFNAMSIZ - 1);
+        if (::ioctl( fd_, SIOCGIFINDEX, &ifr) < 0)
+            throw std::runtime_error("SocketCAN J1939: ioctl failed: " + std::string(strerror(errno)));
+
+        struct sockaddr_can addr{};
+        addr.can_family              = AF_CAN;
+        addr.can_ifindex             = ifr.ifr_ifindex;
+        addr.can_addr.j1939.name     = config_.src_name;
+        addr.can_addr.j1939.pgn      = config_.pgn;
+        addr.can_addr.j1939.addr     = config_.src_addr;
+
+        if (::bind( fd_, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0) {
+            throw std::runtime_error("SocketCAN J1939: bind failed: " + std::string(strerror(errno)));
+        }
+    }
+
+    void SocketCANJ1939::ApplySocketOptions() {
+        if ( config_.promiscuous) {
+            int v = 1;
+            if (setsockopt(fd_, SOL_CAN_J1939, SO_J1939_PROMISC, &v, sizeof(v)) < 0) {
+                throw std::runtime_error("SocketCAN J1939: SO_J1939_PROMISC failed: " + std::string(strerror(errno)));
+            }
+        }
+
+        // Set send priority
+        {
+            int prio = static_cast<int>( config_.send_priority);
+            if (setsockopt(fd_, SOL_CAN_J1939, SO_J1939_SEND_PRIO, &prio, sizeof(prio)) < 0) {
+                throw std::runtime_error("SocketCAN J1939: SO_J1939_SEND_PRIO failed: " + std::string(strerror(errno)));
+            }
+        }
+    }
+
+    void SocketCANJ1939::SendMessage(uint32_t pgn, uint8_t dest_addr, std::span<const uint8_t> data) {
+        struct ifreq ifr{};
+        std::strncpy(ifr.ifr_name, config_.interface.c_str(), IFNAMSIZ - 1);
+        ::ioctl(fd_, SIOCGIFINDEX, &ifr);
+
+        struct sockaddr_can dest{};
+        dest.can_family              = AF_CAN;
+        dest.can_ifindex             = ifr.ifr_ifindex;
+        dest.can_addr.j1939.pgn      = pgn;
+        dest.can_addr.j1939.addr     = dest_addr;
+        dest.can_addr.j1939.name     = J1939_NO_NAME;
+
+        ssize_t n = ::sendto(fd_, data.data(), data.size(), 0,reinterpret_cast<struct sockaddr*>(&dest),sizeof(dest));
+        if (n < 0) {
+            throw std::runtime_error("SocketCAN J1939: sendto failed: " + std::string(strerror(errno)));
+        }
+
+    }
+
+    void SocketCANJ1939::WriteFrame(canid_t id, std::span<const uint8_t> data, FrameType type) {
+        // For J1939 the TX queue worker falls through here;
+        // use sendMessage() directly for full PGN control.
+        if (::write( fd_, data.data(), data.size()) < 0) {
+            throw std::runtime_error("SocketCAN J1939: write failed: " + std::string(strerror(errno)));
+        }
+    }
+
+    std::future<ReceivedFrame> SocketCANJ1939::ReceiveAsync() {
+        return SocketCANBase::ReceiveAsync();
+    }
 }

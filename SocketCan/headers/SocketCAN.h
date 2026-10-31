@@ -62,6 +62,7 @@ namespace SocketCAN {
     struct CanFilter {
         canid_t id{0};
         canid_t mask{CAN_SFF_MASK};
+        bool invertMatch{false};   // true = block matching, pass rest
     };
 
     /*Base socket configuration*/
@@ -130,7 +131,7 @@ namespace SocketCAN {
 
         void ApplyTimeStampOptions();
         void ApplyFilters();
-        ReceivedFrame ExtractTimestamp(struct mshdr& msg, ReceivedFrame  frame);
+        ReceivedFrame ExtractTimestamp(struct msghdr& msg, ReceivedFrame  frame);
         int fd_{-1};
         BaseConfig cfg_;
 

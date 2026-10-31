@@ -60,7 +60,7 @@ namespace SocketCAN {
         uint8_t rx_ext_address{0x00};
         uint32_t tx_padding{0};
         uint32_t rx_block_size{0};
-        uint32_t st_min_ns[0];
+        uint32_t st_min_ns{0};
         bool wait_tx_done{true};
     };
 
